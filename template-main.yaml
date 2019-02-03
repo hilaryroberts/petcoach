@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: DataPipeline Job that performs conformance checking against petri nets
+Parameters:
+  Datacenter:
+    Description: Datacenter
+    Type: String
+  Environment:
+    Description: Environment
+    Type: String
+  Capability:
+    Description: Capability
+    Type: String
+    Default: datalake
+  Service:
+    Description: Service
+    Type: String
+    Default: petcoach
+  Type:
+    Description: Type
+    Type: String
+    Default: datapipeline
+  MajorVersion:
+    Description: MajorVersion
+    Type: String
+    Default: 1
+  Component:
+    Description: Component
+    Type: String
+    Default: main
+  CodeBucketUri:
+    Description: The S3 bucket that the contains the script to run
+    Type: String
+  CodeBucketPrefix:
+    Description: The prefix of the script to run in S3 (interpolated with {bucket}/{environment}/{prefix})
+    Type: String
+  NumberOfNodes:
+    Description: The number of worker nodes to add to the EMR cluster
+    Type: String
+    Default: "8"
+  PipelineStartDate:
+    Description: The start date of the datapipeline
+    Type: String
+
+Resources:
+  ReportBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      AccessControl: BucketOwnerFullControl
+      BucketName: !Sub ${Datacenter}-${Environment}-${Capability}-${Service}-${Type}-v${MajorVersion}-reports
+      Tags:
+        - Key: Datacenter
+          Value: !Ref Datacenter
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Capability
+          Value: !Ref Capability
+        - Key: Service
+          Value: !Ref Service
+        - Key: Type
+          Value: !Ref Type
+        - Key: MajorVersion
+          Value: !Ref MajorVersion
+        - Key: Component
+          Value: !Ref Component
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !Sub arn:aws:lambda:eu-west-1:${AWS::AccountId}:function:${Datacenter}-${Environment}-datalake-petcoachCopyToRedshift-lambda-v1
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: "_SUCCESS"
+
+  PetcoachDatapipelineJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: AllowJobToWriteToOutputBucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                  - s3:Get*
+                  - s3:List*
+                  - s3:Put*
+                Resource:
+                  - !Sub arn:aws:s3:::${Datacenter}-${Environment}-${Capability}-${Service}-${Type}-v${MajorVersion}-reports
+                  - !Sub arn:aws:s3:::${Datacenter}-${Environment}-${Capability}-${Service}-${Type}-v${MajorVersion}-reports/*
+        - PolicyName: AllowJobToReadFromMessageReaderBucket
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                Resource:
+                  - !Sub arn:aws:s3:::${Datacenter}-${Environment}-dwh2-messagereader-s3/*
+                  - !Sub arn:aws:s3:::${Datacenter}-${Environment}-dwh2-messagereader-s3
+
+  PetcoachDataPipeline:
+    Type: "AWS::DataPipeline::Pipeline"
+    Properties:
+      Name: !Sub ${Datacenter}-${Environment}-${Capability}-${Service}-${Type}-v${MajorVersion}
+      Description: A spark job to conformance check event data against a set of petri nets
+      Activate: true
+      ParameterObjects:
+        - Id: "myEC2KeyPair"
+          Attributes: 
+            - Key: "description"
+              StringValue: "EC2 key pair"
+            - Key: "type"
+              StringValue: "String"
+            - Key: "helpText"
+              StringValue: "An existing EC2 key pair to SSH into the master node of the EMR cluster as the user \"hadoop\"."
+            - Key: "optional"
+              StringValue: "true"
+        - Id: "myEmrStep"
+          Attributes: 
+            - Key: "description"
+              StringValue: "EMR step(s)"
+            - Key: "type"
+              StringValue: "String"
+            - Key: "helpLink"
+              StringValue: "https://docs.aws.amazon.com/console/datapipeline/emrsteps"
+            - Key: "helpText"
+              StringValue: "A step is a unit of work you submit to the cluster. You can specify one or more steps"
+            - Key: "watermark"
+              StringValue: "s3://myBucket/myPath/myStep.jar,firstArg,secondArg"
+            - Key: "isArray"
+              StringValue: "true"
+        - Id: "myTaskInstanceType"
+          Attributes: 
+            - Key: "description"
+              StringValue: "Task node instance type"
+            - Key: "type"
+              StringValue: "String"
+            - Key: "helpText"
+              StringValue: "Task instances run Hadoop tasks."
+            - Key: "optional"
+              StringValue: "true"
+        - Id: "myCoreInstanceType"
+          Attributes: 
+            - Key: "description"
+              StringValue: "Core node instance type"
+            - Key: "type"
+              StringValue: "String"
+            - Key: "helpText"
+              StringValue: "Core instances run Hadoop tasks and store data using the Hadoop Distributed File System (HDFS)."
+            - Key: "default"
+              StringValue: "m1.medium"
+        - Id: "myEMRReleaseLabel"
+          Attributes: 
+            - Key: "description"
+              StringValue: "EMR Release Label"
+            - Key: "type"
+              StringValue: "String"
+            - Key: "helpText"
+              StringValue: "Determines the base configuration of the instances in your cluster, including the Hadoop version."
+            - Key: "default"
+              StringValue: "emr-5.16.0"
+        - Id: "myCoreInstanceCount"
+          Attributes: 
+            - Key: "description"
+              StringValue: "Core node instance count"
+            - Key: "type"
+              StringValue: "Integer"
+            - Key: "default"
+              StringValue: "2"
+        - Id: "myTaskInstanceCount"
+          Attributes: 
+            - Key: "description"
+              StringValue: "Task node instance count"
+            - Key: "type"
+              StringValue: "Integer"
+            - Key: "optional"
+              StringValue: "true"
+        - Id: "myBootstrapAction"
+          Attributes: 
+            - Key: "description"
+              StringValue: "Bootstrap action(s)"
+            - Key: "type"
+              StringValue: "String"
+            - Key: "helpLink"
+              StringValue: "https://docs.aws.amazon.com/console/datapipeline/emr_bootstrap_actions"
+            - Key: "helpText"
+              StringValue: "Bootstrap actions are scripts that are executed during setup before Hadoop starts on every cluster node."
+            - Key: "optional"
+              StringValue: "true"
+            - Key: "isArray"
+              StringValue: "true"
+        - Id: "myMasterInstanceType"
+          Attributes: 
+            - Key: "description"
+              StringValue: "Master node instance type"
+            - Key: "type"
+              StringValue: "String"
+            - Key: "helpText"
+              StringValue: "The Master instance assigns Hadoop tasks to core and task nodes, and monitors their status."
+            - Key: "default"
+              StringValue: "m1.medium"
+      ParameterValues:
+        - Id: "myEMRReleaseLabel"
+          StringValue: "emr-5.8.0"
+        - Id: "myMasterInstanceType"
+          StringValue: "m3.xlarge"
+        - Id: "myEmrStep"
+          StringValue: !Sub "command-runner.jar,spark-submit,--driver-memory,5000,--executor-memory,3520MB,--conf,spark.yarn.driver.memoryOverhead=6000,--conf,spark.yarn.executor.memoryOverhead=8000,--deploy-mode,cluster,--py-files,/home/hadoop/spark_tools.zip,--files,/home/hadoop/models.zip,${CodeBucketUri}/${Environment}/${CodeBucketPrefix},${Datacenter},${Environment}"
+        - Id: "myCoreInstanceType"
+          StringValue: "m3.xlarge"
+        - Id: "myCoreInstanceCount"
+          StringValue: !Ref NumberOfNodes
+        - Id: "myBootstrapAction"
+          StringValue: !Sub "${CodeBucketUri}/${Environment}/bootstrap-tools/petcoach_bootstrap_${Environment}.sh"
+      PipelineObjects:
+        - Name: "EmrActivityObj"
+          Id: "EmrActivityObj"
+          Fields:
+            - Key: "step"
+              StringValue: "#{myEmrStep}"
+            - Key: "type"
+              StringValue: "EmrActivity"
+            - Key: "runsOn"
+              RefValue: "EmrClusterObj"
+        - Name: "EmrClusterObj"
+          Id: "EmrClusterObj"
+          Fields:
+            - Key: "taskInstanceType"
+              StringValue: "#{myTaskInstanceType}"
+            - Key: "coreInstanceCount"
+              StringValue: "#{myCoreInstanceCount}"
+            - Key: "masterInstanceType"
+              StringValue: "#{myMasterInstanceType}"
+            - Key: "releaseLabel"
+              StringValue: "#{myEMRReleaseLabel}"
+            - Key: "type"
+              StringValue: "EmrCluster"
+            - Key: "terminateAfter"
+              StringValue: "8 Hours"
+            - Key: "bootstrapAction"
+              StringValue: "#{myBootstrapAction}"
+            - Key: "taskInstanceCount"
+              StringValue: "#{myTaskInstanceCount}"
+            - Key: "coreInstanceType"
+              StringValue: "#{myCoreInstanceType}"
+            - Key: "keyPair"
+              StringValue: "#{myEC2KeyPair}"
+            - Key: "applications"
+              StringValue: "Spark"
+            - Key: "configuration"
+              RefValue: "EmrConfigurationId_Mxf3b"
+            - Key: "configuration"
+              RefValue: "EmrConfigurationId_CzmCD"
+        - Name: "Default"
+          Id: "Default"
+          Fields:
+            - Key: "type"
+              StringValue: "Default"
+            - Key: "failureAndRerunMode"
+              StringValue: "CASCADE"
+            - Key: "resourceRole"
+              StringValue: "DataPipelineDefaultResourceRole"
+            - Key: "role"
+              StringValue: "DataPipelineDefaultRole"
+            - Key: "pipelineLogUri"
+              StringValue: !Sub "s3://aws-logs-${AWS::AccountId}-eu-west-1/elasticmapreduce/"
+            - Key: "scheduleType"
+              StringValue: "cron"
+            - Key: "schedule"
+              RefValue: "DefaultSchedule"
+        - Name: "export_config"
+          Id: "EmrConfigurationId_qCcIi"
+          Fields:
+            - Key: "classification"
+              StringValue: "export"
+            - Key: "type"
+              StringValue: "EmrConfiguration"
+            - Key: "property"
+              RefValue: "PropertyId_vf60S"
+        - Name: "python_version"
+          Id: "PropertyId_vf60S"
+          Fields:
+            - Key: "type"
+              StringValue: "Property"
+            - Key: "value"
+              StringValue: "python34"
+            - Key: "key"
+              StringValue: "PYSPARK_PYTHON"
+        - Name: "output_comitter_class"
+          Id: "PropertyId_PAwpo"
+          Fields:
+            - Key: "type"
+              StringValue: "Property"
+            - Key: "value"
+              StringValue: "org.apache.hadoop.mapred.FileOutputCommitter"
+            - Key: "key"
+              StringValue: "mapred.output.committer.class"
+        - Name: "configureSparkEnv"
+          Id: "EmrConfigurationId_Mxf3b"
+          Fields:
+            - Key: "type"
+              StringValue: "EmrConfiguration"
+            - Key: "classification"
+              StringValue: "spark-env"
+            - Key: "configuration"
+              RefValue: "EmrConfigurationId_qCcIi"
+        - Name: "Every week"
+          Id: "DefaultSchedule"
+          Fields:
+            - Key: "period"
+              StringValue: "7 Days"
+            - Key: "type"
+              StringValue: "Schedule"
+            - Key: "startDateTime"
+              StringValue: !Ref PipelineStartDate
+        - Name: "file_output_committer_version"
+          Id: "PropertyId_yI8kA"
+          Fields:
+            - Key: "type"
+              StringValue: "Property"
+            - Key: "value"
+              StringValue: "2"
+            - Key: "key"
+              StringValue: "mapreduce.fileoutputcommitter.algorithm.version"
+        - Name: "mapred_config"
+          Id: "EmrConfigurationId_CzmCD"
+          Fields:
+            - Key: "classification"
+              StringValue: "mapred-site"
+            - Key: "type"
+              StringValue: "EmrConfiguration"
+            - Key: "property"
+              RefValue: "PropertyId_yI8kA"
+            - Key: "property"
+              RefValue: "PropertyId_PAwpo"
+
+
