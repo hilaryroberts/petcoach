@@ -1,12 +1,9 @@
 """Checks data conformance against Petri Net models"""
 
-import sys
 import datetime as dt
-import re
 from pyspark.sql import SparkSession
 import spark_tools.conformance_checking as cfc
 from spark_tools.job_context import ConformanceCheckingContext
-from spark_tools.line_parser import split_line
 from spark_tools.line_parser import join_line
 
 spark = SparkSession.builder.appName("conformance_checker").getOrCreate()
@@ -15,47 +12,17 @@ sc = spark.sparkContext
 
 
 
-def main():
+def process_dataset(dataset, output_path):
     """
     The main function executed by the job
     """
     CfcContext = ConformanceCheckingContext(sc)
-    bucket_details = get_bucket_details()
-    rawdata = get_raw_data(bucket_details)
-    rawdata.cache()
 
-    logs = extract_logs(rawdata)
+    logs = extract_logs(dataset)
     results = check_logs(logs, CfcContext)
     formatted_results = format_results(results, CfcContext)
-    save_results(formatted_results, bucket_details)
+    save_results(formatted_results, output_path)
 
-
-def get_raw_data(bucket_details):
-    """
-    Retrieves the raw data from the messagereader bucket
-    :param bucket_details: environment and date specifics
-    :return: a spark RDD with a day's worth of raw data
-    """
-    if bucket_details[1] == 'pre01':
-        folder = 'copiedFiles'
-    else:
-        folder = 'events'
-    input_path = "s3a://%s-%s-dwh2-messagereader-s3/%s/%s" % \
-                 (bucket_details[0], bucket_details[1], folder, bucket_details[2])
-    input_rdd = sc.textFile(input_path)
-    input_rdd = input_rdd.map(split_line)
-    return input_rdd
-
-
-def get_bucket_details():
-    """
-    Retrieve environment details and the path corresponding to the previous day's date
-    :return: A string tuple with the datacenter, environment and datepath
-    """
-    datacenter = sys.argv[1]
-    environment = sys.argv[2]
-    datepath = re.sub('/0', '/', (dt.datetime.now() - dt.timedelta(days=1)).strftime('%Y/%m/%d'))
-    return datacenter, environment, datepath
 
 
 def extract_logs(input_rdd, first_events, last_events):
@@ -68,7 +35,7 @@ def extract_logs(input_rdd, first_events, last_events):
     from the raw data
     :param first_events: List of one or more events that can form the start of the process
     :param last_events: List of one or more events that can form the end of the process
-    :return: An RDD with session logs in the format (ruid, [events in order])
+    :return: An RDD with session logs in the format (case_id, [events in order])
     """
     sessions = group_sessions(input_rdd)
     sorted_sessions = sessions.map(sort_session)
@@ -76,20 +43,20 @@ def extract_logs(input_rdd, first_events, last_events):
     return trimmed_sessions
 
 
-def extract_required_data(raw_data, event_name_generator):
+def extract_required_data(raw_data, case_id_index, timestamp_index, event_name_index):
     """
     formats a row to make it suitable for grouping into sessions
-    :param raw_data: a row of raw data
-    :param event_name_generator: function to generate event names from raw data
-    :return: event record in the format [ruid, [timestamp, event name]]
+    :param raw_data: a row of raw data in form of a list
+    :param case_id_index: the position in the data of the case id
+    :param timestamp_index: the position in the data of the timestamp
+    :param event_name_index: the position in the data of the timestamp
+    :return: event record in the format [case_id, [timestamp, event name]]
     """
-    RUID_INDEX = 8
-    EVENT_DATE_TM_INDEX = 25
     required_data = raw_data.map(lambda x: [
-        x[RUID_INDEX],
+        x[case_id_index],
         [
-            x[EVENT_DATE_TM_INDEX],
-            event_name_generator(x)
+            x[timestamp_index],
+            x[event_name_index]
         ]
     ])
     return required_data
@@ -99,7 +66,7 @@ def group_sessions(ungrouped_events):
     """
     Groups events for one ruid together into a single session
     :param un-grouped_events: RDD with un-grouped events
-    :return: RDD with sessions in the format (ruid, [events in order])
+    :return: RDD with sessions in the format (case_id, [events in order])
     """
     grouped = ungrouped_events.aggregateByKey([[], []],
                                               group_with_zero_value,
@@ -130,24 +97,14 @@ def group_with_two_values(event_list_a, event_list_b):
     return [event_list_a[0]+event_list_b[0], event_list_a[1]+event_list_b[1]]
 
 
-def find_error_sessions(log):
-    """
-    Identifies if there are any sessions containing error events in a session
-    :param log: A session log in the form (ruid, [[timestamps][events]])
-    :return: True if sessions contains errors, else False
-    """
-    errors = [True if re.search('error', x) or re.search('notification', x) else False for x in log[1][1]]
-    return not any(errors)
-
-
 def sort_session(log):
     """
     takes a session as a timestamp/event list set, and orders in based on the timestamps
     Returns only the event names.
     :param log: An session log for a ruid with event names and timestamps in the form
-    [ruid, [[timestamps], [events]]]
+    [case_id, [[timestamps], [events]]]
     :return: An ordered session log without the timestamps in the form
-    [ruid, [events in order]]
+    [case_id, [events in order]]
     """
     sort_zip = sorted(zip(log[1][0], log[1][1]))
     return log[0], [x for _, x in sort_zip]
@@ -158,7 +115,7 @@ def trim_sessions(sessions, first_events, last_events):
     Takes an RDD with session logs and ensures they all start and end with the specified start and
     end events. Logs that do not contain at least one valid start event followed by an end event are
     filtered out.
-    :param sessions: an RDD with session logs in the form [ruid, [events in order]]
+    :param sessions: an RDD with session logs in the form [case_id, [events in order]]
     :param first_events: The names of the possible events a session should start with
     :param last_events: The names of the possible events a session should end with
     :return: An RDD with sessions starting and ending with the specified events
